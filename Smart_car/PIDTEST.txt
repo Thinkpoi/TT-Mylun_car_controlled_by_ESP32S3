@@ -1,0 +1,198 @@
+#include <Arduino.h>
+#include <driver/pcnt.h>
+#include <QuickPID.h>
+
+// ================= 硬件引脚定义 (基于您的 main.cpp) =================
+// 选用 M1 (左前电机) 作为测试对象
+#define PWM_PIN      6     // PWM波形发生器引脚
+#define IN1_PIN      47    // TB6612FNG引脚AIN1
+#define IN2_PIN      21    // TB6612FNG引脚AIN2
+#define ENC_A        38    // 编码器A相
+#define ENC_B        39    // 编码器B相
+#define STANBY_PIN   17    // TB6612待机引脚
+
+// ================= 参数定义 =================
+#define PPR 624              // 编码器标称 PPR
+#define X4 4                 // 四倍频
+#define CPR (PPR * X4)       // 2496
+#define PWM_FREQ 20000       // 20KHz
+#define PWM_RES 10           // 10位分辨率 (0-1023)
+#define PWM_CHANNEL 0        // 使用通道0
+#define SAMPLE_MS 20         // PID 计算与采样周期 (ms) - 稍微放宽至20ms以便观察
+
+// 计算 RPM 的系数: (脉冲数 / CPR) * (60000ms / 采样时间ms)
+const float RPM_FACTOR = (60000.0 / SAMPLE_MS) / CPR; 
+
+// ================= 全局变量 =================
+float setpoint = 0.0;    // 目标 RPM
+float input = 0.0;       // 实际 RPM
+float output = 0.0;      // PID 输出 (PWM)
+
+// 初始 PID 参数 (您可以根据串口指令修改)
+float Kp = 0.0, Ki = 0.0, Kd = 0.0;
+
+// PID 对象
+QuickPID myPID(&input, &output, &setpoint);
+
+// 计时器
+unsigned long lastTime = 0;
+
+// ================= 硬件初始化函数 =================
+
+void initEncoder() {
+    pcnt_config_t pcnt_config = {};
+    pcnt_config.pulse_gpio_num = ENC_A;
+    pcnt_config.ctrl_gpio_num = ENC_B;
+    pcnt_config.unit = PCNT_UNIT_0;
+    pcnt_config.channel = PCNT_CHANNEL_0;
+    
+    // 配置计数模式 (4倍频逻辑的一部分)
+    pcnt_config.pos_mode = PCNT_COUNT_INC; // 上升沿+1
+    pcnt_config.neg_mode = PCNT_COUNT_DEC; // 下降沿-1
+    pcnt_config.lctrl_mode = PCNT_MODE_REVERSE; // 低电平时反向
+    pcnt_config.hctrl_mode = PCNT_MODE_KEEP;    // 高电平保持
+    
+    pcnt_config.counter_h_lim = 30000;
+    pcnt_config.counter_l_lim = -30000;
+
+    pcnt_unit_config(&pcnt_config);
+    
+    // 滤波
+    pcnt_set_filter_value(PCNT_UNIT_0, 100);
+    pcnt_filter_enable(PCNT_UNIT_0);
+
+    // 启动
+    pcnt_counter_pause(PCNT_UNIT_0);
+    pcnt_counter_clear(PCNT_UNIT_0);
+    pcnt_counter_resume(PCNT_UNIT_0);
+}
+
+void initMotor() {
+    pinMode(IN1_PIN, OUTPUT);
+    pinMode(IN2_PIN, OUTPUT);
+    pinMode(STANBY_PIN, OUTPUT);
+    
+    // 开启电机驱动
+    digitalWrite(STANBY_PIN, HIGH); 
+
+    // 配置 PWM (ESP32 Arduino 2.x 写法)
+    ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RES);
+    ledcAttachPin(PWM_PIN, PWM_CHANNEL);
+    ledcWrite(PWM_CHANNEL, 0);
+}
+
+// ================= 辅助函数 =================
+
+// 电机执行函数
+void runMotor(float pwmVal) {
+    int duty = constrain((int)abs(pwmVal), 0, 1023);
+
+     if (duty > 0 && duty < 40) duty = 40;
+
+    if (pwmVal > 0) {
+        // 正转
+        digitalWrite(IN1_PIN, HIGH);
+        digitalWrite(IN2_PIN, LOW);
+        ledcWrite(PWM_CHANNEL, duty);
+    } else if (pwmVal < 0) {
+        // 反转
+        digitalWrite(IN1_PIN, LOW);
+        digitalWrite(IN2_PIN, HIGH);
+        ledcWrite(PWM_CHANNEL, duty);
+    } else {
+        // 停止
+        digitalWrite(IN1_PIN, HIGH);
+        digitalWrite(IN2_PIN, HIGH);
+        ledcWrite(PWM_CHANNEL, 1023); // 刹车
+    }
+}
+
+// 串口指令解析器
+void parseSerialCommand() {
+    if (Serial.available() > 0) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim(); // 去除首尾空格
+        char type = cmd.charAt(0);
+        float value = cmd.substring(1).toFloat();
+
+        switch (toupper(type)) {
+            case 'T': // Target Speed
+                setpoint = value;
+                Serial.printf(">> SET Target: %.2f RPM\n", setpoint);
+                break;
+            case 'P': // Kp
+                Kp = value;
+                myPID.SetTunings(Kp, Ki, Kd);
+                Serial.printf(">> SET Kp: %.4f\n", Kp);
+                break;
+            case 'I': // Ki
+                Ki = value;
+                myPID.SetTunings(Kp, Ki, Kd);
+                Serial.printf(">> SET Ki: %.4f\n", Ki);
+                break;
+            case 'D': // Kd
+                Kd = value;
+                myPID.SetTunings(Kp, Ki, Kd);
+                Serial.printf(">> SET Kd: %.4f\n", Kd);
+                break;
+            default:
+                // 如果直接输入数字，默认作为目标速度
+                if (isdigit(type) || type == '-') {
+                    setpoint = cmd.toFloat();
+                     Serial.printf(">> SET Target: %.2f RPM\n", setpoint);
+                }
+                break;
+        }
+    }
+}
+
+// ================= SETUP =================
+void setup() {
+    Serial.begin(115200);
+    Serial.println("PID Tuning Mode Started...");
+    Serial.println("Commands: T=Target, P=Kp, I=Ki, D=Kd (e.g., T150, P2.0)");
+
+    initMotor();
+    initEncoder();
+
+    // PID 初始化配置
+    myPID.SetMode(QuickPID::Control::automatic);
+    myPID.SetSampleTimeUs(SAMPLE_MS * 1000); // 设置计算周期
+    myPID.SetOutputLimits(-750, 750);      // PWM 限制
+    myPID.SetTunings(Kp, Ki, Kd);
+}
+
+// ================= LOOP =================
+void loop() {
+    // 1. 处理串口指令
+    parseSerialCommand();
+
+    // 2. 定时控制循环
+    unsigned long now = millis();
+    if (now - lastTime >= SAMPLE_MS) {
+        lastTime = now;
+
+        // --- 读取编码器 ---
+        int16_t count = 0;
+        pcnt_get_counter_value(PCNT_UNIT_0, &count);
+        pcnt_counter_clear(PCNT_UNIT_0); // 读完立即清零，计算该时间段内的速度
+
+        // --- 计算速度 (RPM) ---
+        // 简单低通滤波 (可选，如果波形太抖动可调大 0.1)
+        float rawRPM = count * RPM_FACTOR;
+        static float filteredRPM = 0.1;
+        filteredRPM = 0.7 * filteredRPM + 0.3 * rawRPM; 
+        input = filteredRPM;
+
+        // --- 计算 PID ---
+        myPID.Compute();
+
+        // --- 执行电机 ---
+        runMotor(output);
+
+        // --- 串口绘图输出 (适配您的特定格式) ---
+        // 格式: $ 目标值 实际值 ;
+        Serial.printf("samples:%f,%f\n", setpoint, input);
+
+    }
+}

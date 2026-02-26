@@ -1,0 +1,97 @@
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+#include "Wire.h"
+
+MPU6050 mpu;
+
+// 硬件引脚定义
+const int SDA_PIN = 8;
+const int SCL_PIN = 3;
+
+// MPU 控制/状态变量
+uint8_t devStatus;      
+uint16_t packetSize;    
+uint8_t fifoBuffer[64]; 
+
+// 姿态/运动变量
+Quaternion q;           // [w, x, y, z]         四元数
+VectorInt16 aa;         // [x, y, z]            原始加速度
+VectorInt16 aaReal;     // [x, y, z]            线性加速度（去重力）
+VectorFloat gravity;    // [x, y, z]            重力矢量
+float ypr[3];           // [yaw, pitch, roll]   角度容器值
+
+void setup() {
+    Serial.begin(115200);
+    while (!Serial);
+
+    // 1. 初始化自定义引脚的 I2C
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(400000); 
+
+    Serial.println(F("正在初始化设备..."));
+    mpu.initialize();
+
+    // 因为你已经绕过了 ID 校验，这里直接启动 DMP
+    devStatus = mpu.dmpInitialize();
+
+    // 2. 这里的 Offset 值需要根据你的芯片实际情况微调
+    mpu.setXAccelOffset(5298.00000);
+    mpu.setYAccelOffset(-4772.00000);
+    mpu.setZAccelOffset(9146.00000);
+    mpu.setXGyroOffset(39.00000);
+    mpu.setYGyroOffset(12.00000);
+    mpu.setZGyroOffset(8.00000);
+
+    if (devStatus == 0) {
+        // 自动校准
+        mpu.CalibrateAccel(6);
+        mpu.CalibrateGyro(6);
+        
+        Serial.println(F("DMP 启动成功！"));
+        mpu.setDMPEnabled(true);
+        packetSize = mpu.dmpGetFIFOPacketSize();
+    } else {
+        Serial.print(F("DMP 初始化失败，错误代码: "));
+        Serial.println(devStatus);
+        while (1);
+    }
+}
+
+void loop() {
+    // 3. 从 FIFO 获取最新数据包
+    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+        
+        // --- 处理角度 (Yaw/Pitch/Roll) ---
+        mpu.dmpGetQuaternion(&q, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+        // --- 处理三轴加速度 (Linear Acceleration) ---
+        // 这里的加速度已经去掉了重力分量，适合用来做位移计算
+        mpu.dmpGetAccel(&aa, fifoBuffer);
+        mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+
+        // 4. 串口打印
+        // 打印角度 (弧度转角度)
+
+              Serial.print("$");      // 帧头
+      Serial.println(ypr[0] * 180/M_PI);    // 第一个数
+      Serial.print(" ");      // 空格分隔
+      Serial.println(ypr[1] * 180/M_PI);    // 第二个数
+      Serial.print(" ");      // 空格分隔
+      Serial.println(ypr[2] * 180/M_PI);    // 第三个数
+      Serial.print(" ");      // 空格分隔
+      Serial.print(aaReal.x);    // 第五个数
+      Serial.print(" ");      // 空格分隔
+      Serial.print(aaReal.y); 
+      Serial.print(" ");      // 空格分隔
+      Serial.print(aaReal.z);    
+      Serial.println(";");    // 帧尾 + 换行*/
+
+        // 打印线性加速度
+
+
+        // 建议延迟一点，方便串口观察，实际应用中可以缩短
+        delay(5); 
+    }
+}

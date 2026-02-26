@@ -1,0 +1,971 @@
+#include <Arduino.h>
+#include <XboxSeriesXControllerESP32_asukiaaa.hpp>
+#include <WIFI.h>
+#include <Audio.h>
+#include <driver/pcnt.h>
+#include <LittleFS.h>
+#include <QuickPID.h>
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+#include <Wire.h>
+#include "freertos/FreeRTOS.h" // FreeRTOS 核心
+#include "freertos/task.h"     // Task API
+#include "freertos/queue.h"    // Queue API
+
+Audio audio;
+QueueHandle_t audioQueue;
+
+// pwm调速区域50-725
+// 小车标准速度0.71m/s，最大速度0.89m/s
+
+#pragma region 引脚与功能定义
+#define PPR 624 // 编码器标称 PPR（1 倍）
+#define X4 4    // 四倍频
+#define CPR (PPR * X4)
+#define SAMPLE_MS 10 // 采样时间
+#define RPM_FACTOR (60.0 / (SAMPLE_MS / 1000.0))
+#define PCNT_LIMIT 24575 // ≈ 32767 * 0.75 //防止PCNT溢出
+
+float ypr[3]; // yaw / pitch / roll（弧度）
+
+const int DIN = 4;           // DINT引脚，连接数字功放对应引脚
+const int BCLK = 5;          // BCLK引脚，连接数字功放对应引脚
+const int LRC = 16;          // LRC引脚，连接数字功放对应引脚
+#define M1_PWM_PIN 6      // PWM波形发生器引脚1
+#define M2_PWM_PIN 46     // PWM波形发生器引脚2
+#define M3_PWM_PIN 10     // PWM波形发生器引脚3
+#define M4_PWM_PIN 2      // PWM波形发生器引脚4
+#define M1_IN1_PIN 47    // TB6612FNG引脚AIN1 左侧电机
+#define M1_IN2_PIN 21    // TB6612FNG引脚AIN2
+#define M2_IN1_PIN 19    // TB6612FNG引脚BIN1
+#define M2_IN2_PIN 20    // TB6612FNG引脚BIN2
+#define M3_IN1_PIN 40   // TB6612FNG引脚AIN1 右侧电机
+#define M3_IN2_PIN 9     // TB6612FNG引脚AIN2
+#define M4_IN1_PIN 41    // TB6612FNG引脚BIN1
+#define M4_IN2_PIN 42    // TB6612FNG引脚BIN2
+const int STANBY_MOTOR = 17; // tb6612待机引脚
+
+const int ENC1_A = 38; // 编码器A相一单元
+const int ENC1_B = 39;
+const int ENC2_A = 48; // 编码器A相二单元
+const int ENC2_B = 45;
+const int ENC3_A = 14;
+const int ENC3_B = 13;
+const int ENC4_A = 12;
+const int ENC4_B = 11;
+
+const int INT_PIN = 18; // mpu6050引脚
+const int SDA_PIN = 8;
+const int SCL_PIN = 3;
+
+const int VOLREAD = 1; // 读取电压值
+
+const int channel = 0; // 调用PWM0
+const int channel_NUM2 = 1;
+const int channel_NUM3 = 2;
+const int channel_NUM4 = 4;
+#define PWM_FREQ    20000
+#define PWM_RES 10 // 10位分辨率
+#define MAX_PWM     1023.0f
+const int playsound = 0;
+
+// 在 Task2 上方定义死区大小 (0-65535 范围，2000 约等于 3% 的偏移容忍度)
+#define JOY_DEADZONE 4000
+#define JOY_CENTER   32767
+
+double Kp = 2.7; // PID参数
+double Ki = 50.0;
+double Kd = 0.00;
+
+
+double KpW = 1.5 ;
+double KiW = 0.5;
+double KdW = 0.0 ;
+
+
+float RPMSPEED[4] = {0.0}; // 四轮的编码器RPM信息
+double rpm = 0.0;
+
+double readpwm, readpwm2, readpwm3, readpwm4 = 0.0;
+
+double TESTSPEED = 0.0;
+
+float input, output, setpoint;
+float input2, output2, setpoint2;
+float input3, output3, setpoint3;
+float input4, output4, setpoint4; // PID参数
+
+QuickPID myPID(&input, &output, &setpoint);
+QuickPID myPID1(&input2, &output2, &setpoint2);
+QuickPID myPID2(&input3, &output3, &setpoint3);
+QuickPID myPID3(&input4, &output4, &setpoint4);
+
+// --- 新增：航向角 PID 参数 ---
+float yawInput, yawOutput, yawSetpoint;
+// 角度环参数：Kp=2.0, Ki=0.0, Kd=0.1 (根据实际情况微调)
+// 这里的输出将作为旋转速度叠加到运动学模型中
+QuickPID yawPID(&yawInput, &yawOutput, &yawSetpoint); 
+float targetHeading = 0.0; // 全局目标航向
+
+
+// ========== 保护参数 ==========
+#define ZERO_SPEED_THRESHOLD 5.0f // RPM小于此值认为已刹停，允许换向
+#define DEADZONE_THRESHOLD   20.0f // PWM死区
+
+// ========== 全局控制数据 (用于任务间通信) ==========
+// 这里建议使用结构体，实际工程中需加互斥锁(Mutex)保护
+struct MotorControlData {
+    float targetPWM[4];    // 目标PWM输入
+    float currentRPM[4];   // 编码器测得的当前速度
+    bool  forceBrake;      // 强制刹车标志
+};
+
+MotorControlData motorData = {
+    {0,0,0,0}, 
+    {0,0,0,0}, 
+    false
+};
+
+// 互斥锁，防止读取数据时发生竞争
+SemaphoreHandle_t xMotorDataMutex;
+
+#pragma endregion
+#pragma region 6050部分
+MPU6050 mpu;
+// --- FreeRTOS 句柄 ---
+TaskHandle_t mpuTaskHandle = NULL;
+SemaphoreHandle_t mpuSemaphore;
+// --- 全局变量 ---
+volatile bool requestCalibration = false;
+bool lastReqState = false;
+float filteredYaw = 0;
+float alpha = 0.1; // 低通滤波系数
+// --- 中断服务程序 (ISR) ---
+// 使用 IRAM_ATTR 确保代码运行在 RAM 中以提高速度
+void IRAM_ATTR mpuInterruptHandler()
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    // 释放信号量，通知任务处理数据
+    xSemaphoreGiveFromISR(mpuSemaphore, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken)
+    {
+        portYIELD_FROM_ISR();
+    }
+}
+
+// --- 自动校准逻辑 ---
+void runAutoCalibration()
+{
+    Serial.println(F("\n>>> 正在启动自动校准，请保持静止..."));
+    mpu.setXAccelOffset(0);
+    mpu.setYAccelOffset(0);
+    mpu.setZAccelOffset(0);
+    mpu.setXGyroOffset(0);
+    mpu.setYGyroOffset(0);
+    mpu.setZGyroOffset(0);
+
+    mpu.CalibrateAccel(6);
+    mpu.CalibrateGyro(6);
+    mpu.PrintActiveOffsets();
+    Serial.println(F(">>> 校准完成！\n"));
+}
+#pragma region TB6612封装
+class MotorDriver {
+private:
+    int pwmPin, in1Pin, in2Pin;
+    int pwmChannel;
+    
+public:
+    void init(int pPWM, int pIN1, int pIN2, int channel) {
+        pwmPin = pPWM;
+        in1Pin = pIN1;
+        in2Pin = pIN2;
+        pwmChannel = channel;
+
+        pinMode(in1Pin, OUTPUT);
+        pinMode(in2Pin, OUTPUT);
+        
+        // ESP32 Arduino 2.x 写法 (3.x写法略有不同)
+        ledcSetup(pwmChannel, PWM_FREQ, PWM_RES);
+        ledcAttachPin(pwmPin, pwmChannel);
+        
+        stop();
+    }
+
+    // 刹车 (TB6612 Short Brake: IN1=H, IN2=H)
+    void stop() {
+        digitalWrite(in1Pin, HIGH);
+        digitalWrite(in2Pin, HIGH);
+        ledcWrite(pwmChannel, 1023); // 此时PWM通常无所谓，但保持高电平确保刹车力度
+    }
+
+    // 正转
+    void forward(int pwm) {
+        digitalWrite(in1Pin, HIGH);
+        digitalWrite(in2Pin, LOW);
+        ledcWrite(pwmChannel, pwm);
+    }
+
+    // 反转
+    void reverse(int pwm) {
+        digitalWrite(in1Pin, LOW);
+        digitalWrite(in2Pin, HIGH);
+        ledcWrite(pwmChannel, pwm);
+    }
+
+    // 核心更新函数：包含保护逻辑
+    void update(float targetInput, float currentRPM, bool globalBrake) {
+        // 1. 强制刹车或死区检测
+        if (globalBrake || (targetInput >= -DEADZONE_THRESHOLD && targetInput <= DEADZONE_THRESHOLD)) {
+            stop();
+            return;
+        }
+
+        int pwmDuty = constrain((int)abs(targetInput), 0, (int)MAX_PWM);
+
+        // 2. 逻辑判断
+        if (targetInput > 0) {
+            // 意图：正转
+            // 保护：如果当前还在反转（RPM为负且绝对值较大），必须先刹车
+            if (currentRPM < -ZERO_SPEED_THRESHOLD) {
+                stop(); // 等待速度降下来
+            } else {
+                forward(pwmDuty);
+            }
+        } 
+        else {
+            // 意图：反转
+            // 保护：如果当前还在正转（RPM为正且绝对值较大），必须先刹车
+            if (currentRPM > ZERO_SPEED_THRESHOLD) {
+                stop(); // 等待速度降下来
+            } else {
+                reverse(pwmDuty);
+            }
+        }
+    }
+};
+
+// 实例化4个电机对象
+MotorDriver motors[4];
+
+
+#pragma endregion
+#pragma endregion
+#pragma region 编码器部分
+void pcntInitEncoder(
+    pcnt_unit_t unit,
+    gpio_num_t pinA,
+    gpio_num_t pinB)
+{
+    // ---------- Channel 0：A 相 ----------
+    pcnt_config_t ch0 = {};
+    ch0.unit = unit;
+    ch0.channel = PCNT_CHANNEL_0;
+    ch0.pulse_gpio_num = pinA;
+    ch0.ctrl_gpio_num = pinB;
+
+    ch0.pos_mode = PCNT_COUNT_INC; // A 上升沿
+    ch0.neg_mode = PCNT_COUNT_DEC; // A 下降沿
+
+    ch0.lctrl_mode = PCNT_MODE_REVERSE;
+    ch0.hctrl_mode = PCNT_MODE_KEEP;
+
+    ch0.counter_h_lim = PCNT_LIMIT; // 只用 3/4
+    ch0.counter_l_lim = -PCNT_LIMIT;
+
+    pcnt_unit_config(&ch0);
+
+    // ---------- Channel 1：B 相 ----------
+    pcnt_config_t ch1 = {};
+    ch1.unit = unit;
+    ch1.channel = PCNT_CHANNEL_1;
+    ch1.pulse_gpio_num = pinB;
+    ch1.ctrl_gpio_num = pinA;
+
+    ch1.pos_mode = PCNT_COUNT_INC;
+    ch1.neg_mode = PCNT_COUNT_DEC;
+
+    ch1.lctrl_mode = PCNT_MODE_KEEP;
+    ch1.hctrl_mode = PCNT_MODE_REVERSE;
+
+    ch1.counter_h_lim = PCNT_LIMIT;
+    ch1.counter_l_lim = -PCNT_LIMIT;
+
+    pcnt_unit_config(&ch1);
+
+    // ---------- 滤波 ----------
+    pcnt_set_filter_value(unit, 200); // 约 2.5 µs
+    pcnt_filter_enable(unit);
+
+    // ---------- 启动 ----------
+    pcnt_counter_pause(unit);
+    pcnt_counter_clear(unit);
+    pcnt_counter_resume(unit);
+}
+
+void initAllEncoders()
+{
+    pcntInitEncoder(PCNT_UNIT_0, (gpio_num_t)ENC1_A, (gpio_num_t)ENC1_B);
+    pcntInitEncoder(PCNT_UNIT_1, (gpio_num_t)ENC2_A, (gpio_num_t)ENC2_B);
+    pcntInitEncoder(PCNT_UNIT_2, (gpio_num_t)ENC3_A, (gpio_num_t)ENC3_B);
+    pcntInitEncoder(PCNT_UNIT_3, (gpio_num_t)ENC4_A, (gpio_num_t)ENC4_B);
+}
+#pragma endregion
+
+void playAudio(int index)
+{
+    // 将播放索引发送至队列（不等待，如果队列满了就跳过）
+    xQueueSend(audioQueue, &index, 0);
+}
+
+#pragma region XBOX
+// 需要在此替换成自己的手柄蓝牙MAC地址
+XboxSeriesXControllerESP32_asukiaaa::Core
+    xboxController("ac:8e:bd:66:8d:60");
+String xbox_string()
+{
+    String str = String(xboxController.xboxNotif.btnY) + "," +
+                 String(xboxController.xboxNotif.btnX) + "," +
+                 String(xboxController.xboxNotif.btnB) + "," +
+                 String(xboxController.xboxNotif.btnA) + "," +
+                 String(xboxController.xboxNotif.btnLB) + "," +
+                 String(xboxController.xboxNotif.btnRB) + "," +
+                 String(xboxController.xboxNotif.btnSelect) + "," +
+                 String(xboxController.xboxNotif.btnStart) + "," +
+                 String(xboxController.xboxNotif.btnXbox) + "," +
+                 String(xboxController.xboxNotif.btnShare) + "," +
+                 String(xboxController.xboxNotif.btnLS) + "," +
+                 String(xboxController.xboxNotif.btnRS) + "," +
+                 String(xboxController.xboxNotif.btnDirUp) + "," +
+                 String(xboxController.xboxNotif.btnDirRight) + "," +
+                 String(xboxController.xboxNotif.btnDirDown) + "," +
+                 String(xboxController.xboxNotif.btnDirLeft) + "," +
+                 String(xboxController.xboxNotif.joyLHori) + "," +
+                 String(xboxController.xboxNotif.joyLVert) + "," +
+                 String(xboxController.xboxNotif.joyRHori) + "," +
+                 String(xboxController.xboxNotif.joyRVert) + "," +
+                 String(xboxController.xboxNotif.trigLT) + "," +
+                 String(xboxController.xboxNotif.trigRT) + "\n";
+    return str;
+};
+
+/*
+               (xboxController.xboxNotif.btnY)  Y键，bool
+               (xboxController.xboxNotif.btnX)  X键
+               (xboxController.xboxNotif.btnB)  B键
+               (xboxController.xboxNotif.btnA)  A键
+               (xboxController.xboxNotif.btnLB)  左肩键
+               (xboxController.xboxNotif.btnRB)  右肩键
+               (xboxController.xboxNotif.btnSelect)  切换键
+               (xboxController.xboxNotif.btnStart)  开始键
+               (xboxController.xboxNotif.btnXbox)  西瓜键
+               (xboxController.xboxNotif.btnShare)  分享键
+               (xboxController.xboxNotif.btnLS)  左摇杆键
+               (xboxController.xboxNotif.btnRS)  右摇杆键
+               (xboxController.xboxNotif.btnDirUp) 十字键上
+               (xboxController.xboxNotif.btnDirRight)  十字键右
+               (xboxController.xboxNotif.btnDirDown)  十字键下
+               (xboxController.xboxNotif.btnDirLeft)  十字键左
+               (xboxController.xboxNotif.joyLHori)  左摇杆Y轴 0-65535
+               (xboxController.xboxNotif.joyLVert)  左摇杆X轴 0--65535
+               (xboxController.xboxNotif.joyRHori)  右摇杆Y轴 0--65535
+               (xboxController.xboxNotif.joyRVert)  右摇杆X轴 0--65535
+               (xboxController.xboxNotif.trigLT)  左扳机键 0-1023
+               (xboxController.xboxNotif.trigRT)  右扳机键 0-1023
+*/
+
+/*
+支持四种振动模式
+left：上左电机动
+right：上右电机动
+center：下左电机和下右电机一起动，频率高力量小
+shake：下左电机和下右电机一起动，频率低力量大
+
+测试结果：
+四种模式都可以调振动力度
+下左电机和下右电机是绑定的，只能一起动，但是提供了两种振动模式，个人猜测是两种模式的原理是给电机不同的电压
+可以随意搭配使用，但center和shake一起用的话执行的应该是shake
+*/
+
+// 配置参考
+// repo.v.select.center = 0;
+// repo.v.select.left = 0;
+// repo.v.select.right = 0;
+// repo.v.select.shake = 0;
+// repo.v.power.center = 0; // x% power
+// repo.v.power.left = 0;
+// repo.v.power.right = 30;
+// repo.v.power.shake = 0;
+// repo.v.timeActive = 0; // 振动 x/100 秒，最大2.56秒(uint8_t)
+// repo.v.timeSilent = 0;   // 静止 x/100 秒
+// repo.v.countRepeat = 0;  // 循环次数 x+1
+#pragma endregion
+
+#pragma region XBOX_TASK
+void Task1(void *pvParameters) // FreeRTOS 任务函数，参数必须是 void*
+{
+    bool songd = 0;
+    bool songd2 = 0;
+    while (1)
+    {
+        xboxController.onLoop();
+        vTaskDelay(pdMS_TO_TICKS(5));
+        if (xboxController.isConnected())
+        {
+            if (xboxController.isWaitingForFirstNotification())
+            {
+                Serial.println("waiting for first notification");
+            }
+            else
+            {
+                // Serial.print(xbox_string());
+                //  demoVibration();
+                //  demoVibration_2();
+            }
+        }
+        else
+        {
+            Serial.println("not connected");
+            playAudio(7);
+            vTaskDelay(3000 / portTICK_PERIOD_MS);
+            if (xboxController.getCountFailedConnection() > 10)
+            {
+                ESP.restart();
+            }
+        }
+        if (xboxController.xboxNotif.btnLB == 1 && songd == 0)
+        {
+            playAudio(1);
+            songd = 1;
+        }
+        if (xboxController.xboxNotif.btnLB == 0 && songd == 1)
+        {
+            songd = 0;
+        }
+        if (xboxController.xboxNotif.btnRB == 1 && songd2 == 0)
+        {
+            requestCalibration = true;
+            songd2 = 1;
+        }
+        if (xboxController.xboxNotif.btnRB == 0 && songd2 == 1)
+        {
+            songd2 = 0;
+        }
+    }
+}
+#pragma endregion
+
+#pragma region 电机驱动TASK
+
+/**
+ * @brief 计算角度最小误差 (处理 0-360 跨界问题)
+ * 返回值范围 -180 ~ 180
+ */
+float getAngleError(float target, float current) {
+    float error = target - current;
+    while (error > 180) error -= 360;
+    while (error < -180) error += 360;
+    return error;
+}
+
+/**
+ * @brief 麦克纳姆轮逆运动学解算
+ * @param vY 前后速度 (mm/s 或 RPM)
+ * @param vX 左右横移速度
+ * @param vZ 旋转速度 (由角度 PID 输出)
+ */
+void kinematics_resolver(float vY, float vX, float vZ) {
+    // 麦克纳姆轮速度解算公式
+    // M1(左前), M2(左后), M3(右前), M4(右后)
+    // 根据电机安装方向，符号可能需要微调
+    float target1 = vY + vX + vZ; 
+    float target2 = vY - vX + vZ; 
+    float target3 = vY - vX - vZ; 
+    float target4 = vY + vX - vZ; 
+
+    // 幅值归一化 (防止叠加后超过最大转速)
+    float max_val = abs(target1);
+    if (abs(target2) > max_val) max_val = abs(target2);
+    if (abs(target3) > max_val) max_val = abs(target3);
+    if (abs(target4) > max_val) max_val = abs(target4);
+
+    float speed_limit = 250.0f; // 设定的最大目标RPM，根据实际电机能力调整
+    if (max_val > speed_limit) {
+        float scale = speed_limit / max_val;
+        target1 *= scale;
+        target2 *= scale;
+        target3 *= scale;
+        target4 *= scale;
+    }
+
+    // 更新 PID 的 Setpoint
+    setpoint  = target1;
+    setpoint2 = target2;
+    setpoint3 = target3;
+    setpoint4 = target4;
+}
+
+
+
+void Task2(void *pvParameters)
+{
+    // 等待 MPU 初始化稳定
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    targetHeading = filteredYaw; // 初始锁定当前方向
+
+    while (1)
+    {
+        float moveY = 0, moveX = 0, rotateZ = 0;
+
+        if (xboxController.isConnected()) {
+            // --- 读取原始数据 ---
+            long rawRy = xboxController.xboxNotif.joyRVert; // 右摇杆Y (前后)
+            long rawRx = xboxController.xboxNotif.joyRHori; // 右摇杆X (左右平移)
+            long rawLx = xboxController.xboxNotif.joyLHori; // 左摇杆X (转向)
+
+            // --- 1. 右摇杆 Y轴 (前后移动) ---
+            if (abs(rawRy - JOY_CENTER) > JOY_DEADZONE) {
+                // 超过死区，进行映射
+                // 向上推数值变大还是变小取决于手柄定义，通常: 65535是上，0是下
+                // 这里假设 65535->200 (前进), 0->-200 (后退)
+                // 映射时扣除死区，保证从 0 速度平滑起步
+                if (rawRy > JOY_CENTER) {
+                    moveY = ::map(rawRy, JOY_CENTER + JOY_DEADZONE, 0, 0, 150); 
+                } else {
+                    moveY = ::map(rawRy, JOY_CENTER - JOY_DEADZONE, 65535, 0, -150);
+                }
+            } else {
+                moveY = 0; // 在死区内，强制为 0
+            }
+
+            // --- 2. 右摇杆 X轴 (左右横移) ---
+            if (abs(rawRx - JOY_CENTER) > JOY_DEADZONE) {
+                if (rawRx > JOY_CENTER) {
+                    moveX = ::map(rawRx, JOY_CENTER + JOY_DEADZONE, 65535, 0, 150); // 右移
+                } else {
+                    moveX = ::map(rawRx, JOY_CENTER - JOY_DEADZONE, 0, 0, -150);    // 左移
+                }
+            } else {
+                moveX = 0;
+            }
+
+            // --- 3. 左摇杆 X轴 (改变航向 targetHeading) ---
+            float turnRate = 0;
+            if (abs(rawLx - JOY_CENTER) > JOY_DEADZONE) {
+                if (rawLx > JOY_CENTER) {
+                    // 向右推，航向角增加 (最大速度 3度/周期)
+                    turnRate = ::map(rawLx, JOY_CENTER + JOY_DEADZONE, 65535, 0, 10) / 10.0; 
+                } else {
+                    // 向左推，航向角减少
+                    turnRate = ::map(rawLx, JOY_CENTER - JOY_DEADZONE, 0, 0, -10) / 10.0;
+                }
+                
+                targetHeading += turnRate;
+                // 角度归一化处理 (-180 ~ 180)
+                if (targetHeading > 180) targetHeading -= 360;
+                else if (targetHeading < -180) targetHeading += 360;
+            }
+
+            // --- 4. 角度环 PID 计算 (串级外环) ---
+            float angleError = getAngleError(targetHeading, filteredYaw);
+            
+            // 如果用户正在大幅度手动转向，可以适当减弱 PID 力度防止“抢手”
+            // 但这里为了保持航向锁定，我们始终计算 PID
+            yawSetpoint = 0;
+            yawInput = -angleError; 
+            yawPID.Compute();
+            
+            rotateZ = yawOutput; 
+
+        } else {
+            // 断连刹车
+            moveX = 0; moveY = 0; rotateZ = 0;
+        }
+
+        // --- 5. 运动学解算 ---
+        kinematics_resolver(moveY, moveX, rotateZ);
+
+        // --- 6. 速度环 PID 计算 (内环) ---
+        input = RPMSPEED[0];
+        input2 = RPMSPEED[1];
+        input3 = RPMSPEED[2];
+        input4 = RPMSPEED[3];
+        
+        myPID.Compute(); myPID1.Compute();
+        myPID2.Compute(); myPID3.Compute();
+
+        // --- 7. 写入全局控制数据 ---
+        if (xSemaphoreTake(xMotorDataMutex, portMAX_DELAY) == pdTRUE) {
+            motorData.targetPWM[0] = output;
+            motorData.targetPWM[1] = output2;
+            motorData.targetPWM[2] = output3;
+            motorData.targetPWM[3] = output4;
+            for(int i=0; i<4; i++) motorData.currentRPM[i] = RPMSPEED[i];
+            xSemaphoreGive(xMotorDataMutex);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10)); 
+    }
+}
+
+void TaskMotorControl(void *pvParameters) {
+    // 任务初始化：设置引脚
+    // 注意：LEDC通道 0-7 (S3有8个通道)
+    motors[0].init(M1_PWM_PIN, M1_IN1_PIN, M1_IN2_PIN, 0);
+    motors[1].init(M2_PWM_PIN, M2_IN1_PIN, M2_IN2_PIN, 1);
+    motors[2].init(M3_PWM_PIN, M3_IN1_PIN, M3_IN2_PIN, 2);
+    motors[3].init(M4_PWM_PIN, M4_IN1_PIN, M4_IN2_PIN, 3);
+
+
+    MotorControlData localData;
+
+    TickType_t xLastWakeTime;
+    const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10ms 控制周期 (100Hz)
+    xLastWakeTime = xTaskGetTickCount();
+
+    for (;;) {
+        // 1. 安全地获取全局数据副本
+        if (xSemaphoreTake(xMotorDataMutex, portMAX_DELAY) == pdTRUE) {
+            localData = motorData; // 拷贝数据，快速释放锁
+            xSemaphoreGive(xMotorDataMutex);
+        }
+
+        // 2. 执行每个电机的控制逻辑
+        for (int i = 0; i < 4; i++) { 
+            motors[i].update(localData.targetPWM[i], localData.currentRPM[i], localData.forceBrake);
+        }
+
+        // 3. 绝对延时，确保控制周期稳定
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+#pragma endregion
+#pragma region 6050TASK
+// --- MPU 数据处理任务 ---
+void mpuTask(void *pvParameters)
+{
+    uint8_t fifoBuffer[64];
+    Quaternion q;
+    VectorFloat gravity;
+    float ypr[3];
+
+    // 1. 初始化 I2C
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(400000);
+
+    // 2. 初始化 MPU6050
+    mpu.initialize();
+    uint8_t devStatus = mpu.dmpInitialize();
+
+    if (devStatus == 0)
+    {
+        runAutoCalibration(); // 初始校准
+        mpu.setDMPEnabled(true);
+
+        // 3. 配置 ESP32 外部中断
+        pinMode(INT_PIN, INPUT);
+        attachInterrupt(digitalPinToInterrupt(INT_PIN), mpuInterruptHandler, RISING);
+
+        Serial.println(F("DMP 任务已挂起，等待中断触发..."));
+
+        while (true)
+        {
+            // 等待信号量（阻塞等待，不占用 CPU）
+            if (xSemaphoreTake(mpuSemaphore, portMAX_DELAY) == pdTRUE)
+            {
+
+                // 检查是否有手动校准请求
+                if (requestCalibration)
+                {
+                    runAutoCalibration();
+                    requestCalibration = false;
+                }
+
+                // 读取 FIFO 数据包
+                if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer))
+                {
+                    mpu.dmpGetQuaternion(&q, fifoBuffer);
+                    mpu.dmpGetGravity(&gravity, &q);
+                    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+                    float currentYaw = ypr[0] * 180 / M_PI;
+                    // 低通滤波
+                    filteredYaw = (alpha * currentYaw) + ((1.0 - alpha) * filteredYaw);
+                }
+            }
+        }
+    }
+    else
+    {
+        Serial.println(F("DMP 初始化失败"));
+        vTaskDelete(NULL);
+    }
+}
+#pragma endregion
+#pragma region 串口输出TASK
+void Task5(void *pvParameters)
+{
+    while (1)
+    {
+        
+        Serial.print("$");      // 帧头
+        Serial.println(yawSetpoint);    // 第一个数
+        Serial.print(" ");      // 空格分隔
+        Serial.println(yawInput);
+        Serial.println(";"); // 帧尾 + 换行
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+#pragma endregion
+
+#pragma region 解码器TASK
+void EncoderTask(void *pvParameters)
+{
+    int16_t pulse[4];
+
+    const TickType_t period = SAMPLE_MS / portTICK_PERIOD_MS;
+
+    while (1)
+    {
+        vTaskDelay(period);
+
+        pcnt_get_counter_value(PCNT_UNIT_0, &pulse[0]);
+        pcnt_get_counter_value(PCNT_UNIT_1, &pulse[1]);
+        pcnt_get_counter_value(PCNT_UNIT_2, &pulse[2]);
+        pcnt_get_counter_value(PCNT_UNIT_3, &pulse[3]);
+
+        // ⭐ 关键：立刻清零，避免累计与溢出
+        pcnt_counter_clear(PCNT_UNIT_0);
+        pcnt_counter_clear(PCNT_UNIT_1);
+        pcnt_counter_clear(PCNT_UNIT_2);
+        pcnt_counter_clear(PCNT_UNIT_3);
+
+        for (int i = 0; i < 4; i++)
+        {
+            const char *dir = (pulse[i] >= 0) ? "AH" : "BC";
+
+            float rpm = (pulse[i] * RPM_FACTOR) / CPR;
+
+            // Serial.print("ENC");
+            // Serial.print(i + 1);
+            // Serial.print(" | ");
+            // Serial.print(dir);
+            // Serial.print(" | RPM: ");
+            // Serial.println(rpm);
+            RPMSPEED[i] = rpm;
+        }
+    }
+}
+#pragma endregion
+
+#pragma region 声频播放TASK
+void Task3(void *pvParameters)
+{
+    int fileIndex;
+    char fileName[20];
+
+    while (1)
+    {
+        // 1. 阻塞等待队列消息，直到有人发送播放请求
+        if (xQueueReceive(audioQueue, &fileIndex, portMAX_DELAY) == pdPASS)
+        {
+
+            // 2. 拼接文件名，例如 1 -> "/1.wav"
+            snprintf(fileName, sizeof(fileName), "/%d.wav", fileIndex);
+            Serial.printf("AudioTask: 准备播放 %s\n", fileName);
+
+            // 3. 开始播放
+            if (LittleFS.exists(fileName))
+            {
+                audio.connecttoFS(LittleFS, fileName);
+
+                // 4. 循环调用 loop 直到当前音频播放结束
+                // 这一步实现了“顺序播放”，因为在此循环结束前，任务不会去取下一个队列消息
+                while (audio.isRunning())
+                {
+                    audio.loop();
+                    // 给系统一点喘息时间，防止触发看门狗
+                    vTaskDelay(pdMS_TO_TICKS(2));
+                }
+                Serial.printf("AudioTask: %s 播放完毕\n", fileName);
+            }
+            else
+            {
+                Serial.printf("AudioTask: 文件 %s 不存在\n", fileName);
+            }
+        }
+    }
+}
+#pragma endregion
+#pragma region 电压读取TASK
+void Task4(void *pvParameters)
+{
+    while (1)
+    {
+        float analogVolts = analogReadMilliVolts(VOLREAD);
+        float analogvoltsrealK = (analogVolts / 1000) * 4;
+        // Serial.print("当前电压：");
+        // Serial.print(analogvoltsrealK);
+        if (analogvoltsrealK <= 5.60)
+        {
+            playAudio(4);
+        }
+
+        vTaskDelay(3000 / portTICK_PERIOD_MS);
+    }
+}
+#pragma endregion
+
+#pragma region 启动配置
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("Starting NimBLE Client");
+
+    // 初始化 LittleFS
+    if (!LittleFS.begin())
+    {
+        Serial.println("LittleFS Mount Failed");
+        return;
+    }
+
+    audioQueue = xQueueCreate(10, sizeof(int));
+    xMotorDataMutex = xSemaphoreCreateMutex();
+    digitalWrite(STANBY_MOTOR, HIGH);
+
+    // 配置 I2S 引脚
+    audio.setPinout(BCLK, LRC, DIN);
+
+    // S3 有 8MB PSRAM，我们可以增大缓冲区让播放更平滑
+    // audio.setBufsize(16000, 1000000); // 如果需要可以启用
+
+    audio.setVolume(20); // 0-21
+    if (LittleFS.exists("/5.wav"))
+    {
+        audio.connecttoFS(LittleFS, "/5.wav");
+    }
+    else
+    {
+        Serial.println("Music file not found!");
+    }
+
+    if (audioQueue != NULL)
+    {
+        // 创建音频任务，分配到 Core 1 (Core 0 通常处理 WiFi)
+        xTaskCreatePinnedToCore(
+            Task3,       // 任务函数
+            "AudioTask", // 任务名称
+            16384,       // 栈大小
+            NULL,        // 参数
+            2,           // 优先级 (稍微高一点)
+            NULL,        // 任务句柄
+            1            // 核心 ID
+        );
+    }
+    delay(1000);
+    xboxController.begin();
+
+
+
+    pinMode(STANBY_MOTOR, OUTPUT); // 休眠
+
+
+    xTaskCreate(
+        Task1,   // 任务函数指针
+        "Task1", // 任务名称（仅用于调试）
+        4096,    // 任务堆栈大小（字节）
+        NULL,    // 传递给任务的参数
+        2,       // 任务优先级（数字越大越高）
+        NULL     // 任务句柄（不需要可填 NULL）
+    );
+
+    // 创建电机控制任务 (核心0或1，根据需求，通常控制任务优先级设高一点)
+    xTaskCreatePinnedToCore(
+        TaskMotorControl,   // 任务函数
+        "MotorCtrl",        // 任务名
+        4096,               // 栈大小
+        NULL,               // 参数
+        3,                  // 优先级 (较高)
+        NULL,               // 句柄
+        1                   // 运行核心
+    );
+
+
+    xTaskCreate(
+        Task5,      // 任务函数指针
+        "串口输出", // 任务名称（仅用于调试）
+        4096,       // 任务堆栈大小（字节）
+        NULL,       // 传递给任务的参数
+        2,          // 任务优先级（数字越大越高）
+        NULL        // 任务句柄（不需要可填 NULL）
+
+    );
+
+    initAllEncoders();
+
+    xTaskCreate(
+        EncoderTask,
+        "EncoderTask",
+        4096,
+        NULL,
+        4,
+        NULL);
+
+    myPID.SetMode(QuickPID::Control::automatic);
+    myPID.SetSampleTimeUs(100000);
+    myPID.SetOutputLimits(-750, 750);
+    myPID.SetTunings(Kp, Ki, Kd);
+    myPID1.SetMode(QuickPID::Control::automatic);
+    myPID1.SetSampleTimeUs(100000);
+    myPID1.SetOutputLimits(-750, 750);
+    myPID1.SetTunings(Kp, Ki, Kd);
+    myPID2.SetMode(QuickPID::Control::automatic);
+    myPID2.SetSampleTimeUs(100000);
+    myPID2.SetOutputLimits(-750, 750);
+    myPID2.SetTunings(Kp, Ki, Kd);
+    myPID3.SetMode(QuickPID::Control::automatic);
+    myPID3.SetSampleTimeUs(100000);
+    myPID3.SetOutputLimits(-750, 750);
+    myPID3.SetTunings(Kp, Ki, Kd);
+    
+    // 初始化航向角 PID
+    yawPID.SetMode(QuickPID::Control::automatic);
+    yawPID.SetSampleTimeUs(10000);
+    yawPID.SetOutputLimits(-150, 150); // 限制自动修正的最大旋转速度
+    yawPID.SetTunings(KpW, KiW, KdW);  // 初始参数，需要实测
+
+    xTaskCreate(
+        Task2,
+        "Task2",
+        2048,
+        NULL,
+        4,
+        NULL);
+
+    xTaskCreate(
+        Task4,
+        "Task4",
+        2048,
+        NULL,
+        1,
+        NULL);
+    mpuSemaphore = xSemaphoreCreateBinary();
+    // 创建 FreeRTOS 任务
+    // 核心 1 (Core 1) 运行数据采集，避开 Core 0 的 WiFi/系统后台
+    xTaskCreatePinnedToCore(
+        mpuTask,        // 任务函数
+        "MPU_Task",     // 任务名称
+        4096,           // 栈大小
+        NULL,           // 参数
+        2,              // 优先级 (较高)
+        &mpuTaskHandle, // 句柄
+        1               // 指定核心
+    );
+}
+
+#pragma endregion
+#pragma region loop循环
+void loop()
+{
+}
+#pragma endregion

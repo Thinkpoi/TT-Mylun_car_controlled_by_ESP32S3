@@ -1,0 +1,436 @@
+
+
+ 
+
+#include "Arduino.h"
+#include "LittleFS.h"
+#include "Audio.h"
+
+// ESP32-S3 建议引脚 (可根据实际接线修改)
+#define I2S_LRC            41
+#define I2S_BCLK           42
+#define I2S_DOUT           2
+
+Audio audio;
+
+void setup() {
+    Serial.begin(115200);
+
+    // 初始化 LittleFS
+    if (!LittleFS.begin()) {
+        Serial.println("LittleFS Mount Failed");
+        return;
+    }
+
+    // 配置 I2S 引脚
+    audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+    
+    // S3 有 8MB PSRAM，我们可以增大缓冲区让播放更平滑
+    // audio.setBufsize(16000, 1000000); // 如果需要可以启用
+
+    audio.setVolume(20); // 0-21
+
+    // 播放 LittleFS 里的音乐
+    if (LittleFS.exists("/buie.mp3")) {
+        audio.connecttoFS(LittleFS, "/buie.mp3");
+    } else {
+        Serial.println("Music file not found!");
+    }
+}
+
+void loop() {
+    audio.loop();
+}
+
+// 播放结束的回调
+void audio_eof_mp3(const char *info) {
+    Serial.println("Playback finished.");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+// 官方例程
+void demoVibration()
+{
+  XboxSeriesXHIDReportBuilder_asukiaaa::ReportBase repo;
+  Serial.println("full power for 1 sec");
+  xboxController.writeHIDReport(repo);
+  delay(2000);
+
+  repo.v.select.center = true;
+  repo.v.select.left = false;
+  repo.v.select.right = false;
+  repo.v.select.shake = false;
+  repo.v.power.center = 30; // 30% power
+  repo.v.timeActive = 50;   // 0.5 second
+  Serial.println("run center 30\% power in half second");
+  xboxController.writeHIDReport(repo);
+  delay(2000);
+
+  repo.v.select.center = false;
+  repo.v.select.left = true;
+  repo.v.power.left = 30;
+  Serial.println("run left 30\% power in half second");
+  xboxController.writeHIDReport(repo);
+  delay(2000);
+
+  repo.v.select.left = false;
+  repo.v.select.right = true;
+  repo.v.power.right = 30;
+  Serial.println("run right 30\% power in half second");
+  xboxController.writeHIDReport(repo);
+  delay(2000);
+
+  repo.v.select.right = false;
+  repo.v.select.shake = true;
+  repo.v.power.shake = 30;
+  Serial.println("run shake 30\% power in half second");
+  xboxController.writeHIDReport(repo);
+  delay(2000);
+
+  repo.v.select.shake = false;
+  repo.v.select.center = true;
+  repo.v.power.center = 50;
+  repo.v.timeActive = 20;
+  repo.v.timeSilent = 20;
+  repo.v.countRepeat = 2;
+  Serial.println("run center 50\% power in 0.2 sec 3 times");
+  xboxController.writeHIDReport(repo);
+  delay(2000);
+}
+
+
+// 振动反馈，根据扳机按压力度调整振动力度
+void demoVibration_2()
+{
+  XboxSeriesXHIDReportBuilder_asukiaaa::ReportBase repo;
+  static uint16_t TrigMax = XboxControllerNotificationParser::maxTrig;
+  String str_1;
+  repo.setAllOff();
+  repo.v.select.left = true;
+  repo.v.select.right = true;
+  repo.v.power.left = (uint8_t)((float)xboxController.xboxNotif.trigLT / (float)TrigMax * 100);
+  repo.v.power.right = (uint8_t)((float)xboxController.xboxNotif.trigRT / (float)TrigMax * 100);
+  repo.v.timeActive = 50;
+  xboxController.writeHIDReport(repo);
+  str_1 = String(repo.v.power.left) + "," + String(repo.v.power.right) + "\n";
+
+  Serial.print(str_1);
+  delay(50);
+}
+
+
+/*
+  IMU 零点校准
+
+校准 MPU6050 以补偿可能因陀螺仪和加速度计偏移等因素导致的测量偏差或误差。
+
+运行此示例时，代码会调整 MPU6050 传感器的加速度 (X,Y,Z)
+
+和旋转（陀螺仪）轴偏移值，以确保设备静止时读数尽可能准确。
+
+为了获得更好的结果，请考虑以下事项：
+
+1. MPU6050 模块工作正常。
+
+2. 将 MPU6050 放置在平坦的水平面上，并使其运行 5-10 分钟，使其温度稳定。
+
+4. 位于重力为 1g 的位置。
+
+执行过程中，它将生成十几个输出，显示 6 个所需偏移量中的每一个：
+
+- 首先，尝试找到两个估计值，一个偏低，一个偏高。
+
+- 不断缩小括号，直到无法再缩小为止。
+
+“完成”上方的一行（需要几分钟才能完成）描述了
+
+X 轴加速度、Y 轴加速度、Z 轴加速度、X 轴陀螺仪、Y 轴陀螺仪和
+
+Z 轴陀螺仪的最佳偏移量。
+
+
+完整的 MPU6050 库文档请见此处：
+
+https://github.com/ElectronicCats/mpu6050/wiki
+*/
+
+#include "I2Cdev.h"
+#include "MPU6050.h"
+
+/* 创建 MPU6050 的类。默认 I2C 地址为 0x68。 */
+MPU6050 mpu;
+// MPU6050 mpu(0x69); // <-- 当AD0为高电平时使用
+
+const int usDelay = 3150; // 将采样频率保持在 200Hz 的延迟时间（毫秒）。
+const int NFast = 1000; // 用于计算平均值的快速读数次数越多越好
+const int NSlow = 10000; // 用于计算平均值的慢速读数次数越多越好
+const int LinesBetweenHeaders = 5;
+
+const int iAx = 0;
+const int iAy = 1;
+const int iAz = 2;
+const int iGx = 3;
+const int iGy = 4;
+const int iGz = 5;
+
+int LowValue[6];
+int HighValue[6];
+int Smoothed[6];
+int LowOffset[6];
+int HighOffset[6];
+int Target[6];
+int LinesOut;
+int N;
+int i;
+
+void setup() {
+  Initialize(); //初始化并校准传感器
+  for (i = iAx; i <= iGz; i++) { 
+    Target[i] = 0; // 修复 ZAccel 问题 
+    HighOffset[i] = 0;
+    LowOffset[i] = 0;
+  } 
+  Target[iAz] = 16384; // 设置 Z 轴目标
+  SetAveraging(NFast); // 快速平均
+  PullBracketsOut();
+  PullBracketsIn();
+  Serial.println("-------------- DONE --------------");
+}
+
+void loop() {
+  //Write your code here
+} 
+
+/*初始化函数*/
+void Initialize() {
+  #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+    Wire.begin();
+  #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+    Fastwire::setup(400, true);
+  #endif
+  Serial.begin(9600);
+  // 初始化模块
+  Serial.println("Initializing MPU...");
+  mpu.initialize();
+  Serial.println("MPU initializated");
+  // 检查模块连接
+  Serial.println("Testing device connections...");
+  if(mpu.testConnection() ==  false){
+    Serial.println("MPU6050 connection failed");
+  while(true);
+  }
+  else{
+    Serial.println("MPU6050 connection successful");
+  }
+
+  Serial.println("\nPID tuning Each Dot = 100 readings");
+  /*
+  PID 整定（实际上是 PI 整定）的工作原理如下：更改 MPU6050 中的偏移量即可立即获得结果，
+
+这使我们能够利用 PID 的比例和积分部分来找到理想的偏移量。
+
+积分部分利用与设定点（零）的误差，并将该误差的一部分加到积分值上。
+
+每次读数都会使误差向所需偏移量减小。误差越大，
+
+积分值的调整幅度就越大。
+
+比例部分通过滤除积分计算中的噪声来发挥作用。
+
+由于噪声和传感器静止不动，微分部分不使用。
+
+去除噪声后，积分值在大约 600 次读数后趋于稳定。
+
+在每组 100 次读数结束时，使用积分值作为实际的偏移量，
+
+而忽略最后一次比例读数，因为它容易受到噪声的影响。
+  */
+  Serial.println("\nXAccel\t\tYAccel\t\tZAccel\t\tXGyro\t\tYGyro\t\tZGyro");
+  mpu.CalibrateAccel(6);
+  mpu.CalibrateGyro(6);
+  Serial.println("\n600 总阅读量");
+  mpu.PrintActiveOffsets();
+  mpu.CalibrateAccel(1);
+  mpu.CalibrateGyro(1);
+  Serial.println("700 总阅读量");
+  mpu.PrintActiveOffsets();
+  mpu.CalibrateAccel(1);
+  mpu.CalibrateGyro(1);
+  Serial.println("800 总阅读量");
+  mpu.PrintActiveOffsets();
+  mpu.CalibrateAccel(1);
+  mpu.CalibrateGyro(1);
+  Serial.println("900 总阅读量");
+  mpu.PrintActiveOffsets();
+  mpu.CalibrateAccel(1);
+  mpu.CalibrateGyro(1);
+  Serial.println("1000 总阅读量");
+  mpu.PrintActiveOffsets();
+  Serial.println("\n以上任何偏移量都可以很好地工作。 \n\n用其他方法验证PID:");
+}
+
+void SetAveraging(int NewN) {
+  N = NewN;
+  Serial.print("\n平均 ");
+  Serial.print(N);
+  Serial.println(" 每次读数");
+}
+
+void PullBracketsOut() {
+  boolean Done = false;
+  int NextLowOffset[6];
+  int NextHighOffset[6];
+
+  Serial.println("扩展:");
+  ForceHeader();
+
+  while (!Done) {
+    Done = true;
+    SetOffsets(LowOffset); //设置较低的偏移量
+    GetSmoothed();
+    for (i = 0; i <= 5; i++) { // 获取低值
+      LowValue[i] = Smoothed[i];
+      if (LowValue[i] >= Target[i]) {
+        Done = false;
+        NextLowOffset[i] = LowOffset[i] - 1000;
+      } 
+      else {
+        NextLowOffset[i] = LowOffset[i];
+      }
+    }
+    SetOffsets(HighOffset);
+    GetSmoothed();
+    for (i = 0; i <= 5; i++) { // 获取高值
+      HighValue[i] = Smoothed[i];
+      if (HighValue[i] <= Target[i]) {
+        Done = false;
+        NextHighOffset[i] = HighOffset[i] + 1000;
+      } 
+      else {
+        NextHighOffset[i] = HighOffset[i];
+      }
+    } 
+    ShowProgress();
+    for (int i = 0; i <= 5; i++) {
+      LowOffset[i] = NextLowOffset[i]; 
+      HighOffset[i] = NextHighOffset[i];
+    }
+  }
+}
+
+void PullBracketsIn() {
+  boolean AllBracketsNarrow;
+  boolean StillWorking;
+  int NewOffset[6];
+
+  Serial.println("\nClosing in:");
+  AllBracketsNarrow = false;
+  ForceHeader();
+  StillWorking = true;
+  while (StillWorking) {
+    StillWorking = false;
+    if (AllBracketsNarrow && (N == NFast)) {
+      SetAveraging(NSlow);
+    } 
+    else {
+      AllBracketsNarrow = true;
+    }
+    for (int i = 0; i <= 5; i++) {
+      if (HighOffset[i] <= (LowOffset[i] + 1)) {
+        NewOffset[i] = LowOffset[i];
+      } 
+      else { // 二分查找
+        StillWorking = true;
+        NewOffset[i] = (LowOffset[i] + HighOffset[i]) / 2;
+        if (HighOffset[i] > (LowOffset[i] + 10)) {
+          AllBracketsNarrow = false;
+        }
+      } 
+    }
+    SetOffsets(NewOffset);
+    GetSmoothed();
+    for (i = 0; i <= 5; i++) { // 逼近
+      if (Smoothed[i] > Target[i]) { // 使用下半部分
+        HighOffset[i] = NewOffset[i];
+        HighValue[i] = Smoothed[i];
+      } 
+      else { // 使用上半部分
+        LowOffset[i] = NewOffset[i];
+        LowValue[i] = Smoothed[i];
+      } 
+    }
+    ShowProgress();
+  } 
+} 
+
+void ForceHeader() {
+  LinesOut = 99;
+}
+
+/*用于平滑读取值的函数*/
+void GetSmoothed() {
+  int16_t RawValue[6];
+  long Sums[6];
+  for (i = 0; i <= 5; i++) {
+    Sums[i] = 0;
+  }
+  
+/* Get Sums*/
+  for (i = 1; i <= N; i++) { 
+    mpu.getMotion6( & RawValue[iAx], & RawValue[iAy], & RawValue[iAz], & RawValue[iGx], & RawValue[iGy], & RawValue[iGz]);
+    delayMicroseconds(usDelay);
+    for (int j = 0; j <= 5; j++){
+      Sums[j] = Sums[j] + RawValue[j];
+    }
+  } 
+  for (i = 0; i <= 5; i++) {
+    Smoothed[i] = (Sums[i] + N / 2) / N;
+  }
+} 
+
+/*用于配置 oba=tained 偏移量的函数*/
+void SetOffsets(int TheOffsets[6]) {
+  mpu.setXAccelOffset(TheOffsets[iAx]);
+  mpu.setYAccelOffset(TheOffsets[iAy]);
+  mpu.setZAccelOffset(TheOffsets[iAz]);
+  mpu.setXGyroOffset(TheOffsets[iGx]);
+  mpu.setYGyroOffset(TheOffsets[iGy]);
+  mpu.setZGyroOffset(TheOffsets[iGz]);
+}
+
+/*打印阅读平均值的变化趋势，并添加格式以增强可视化效果。*/
+void ShowProgress() {
+ /*Header*/
+  if (LinesOut >= LinesBetweenHeaders) { 
+    Serial.println("\t\tXAccel\t\t\tYAccel\t\t\t\tZAccel\t\t\tXGyro\t\t\tYGyro\t\t\tZGyro");
+    LinesOut = 0;
+  } 
+  Serial.print(' ');
+  for (i = 0; i <= 5; i++) {
+    Serial.print('[');
+    Serial.print(LowOffset[i]),
+    Serial.print(',');
+    Serial.print(HighOffset[i]);
+    Serial.print("] --> [");
+    Serial.print(LowValue[i]);
+    Serial.print(',');
+    Serial.print(HighValue[i]);
+    if (i == 5) {
+      Serial.println("]");
+    } 
+    else {
+      Serial.print("]\t");
+    }
+  }
+  LinesOut++;
+} 
